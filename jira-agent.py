@@ -12,6 +12,10 @@ import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from logger import log_llm_request, log_llm_response, log_llm_error, log_workflow_step, log_info, log_error
+
+# Global configuration
+MODEL_ID = "anthropic.claude-3-sonnet-20240229-v1:0"
 
 class PDF(fpdf.FPDF):
     def header(self):
@@ -52,17 +56,27 @@ class AgentState:
 def initialize_bedrock():
     """Initialize AWS Bedrock client"""
     try:
+        log_info("Initializing AWS Bedrock client", {"region": "us-east-1"})
         bedrock = boto3.client(
             service_name='bedrock-runtime',
             region_name='us-east-1'
         )
+        log_info("AWS Bedrock client initialized successfully")
         return bedrock
     except Exception as e:
-        st.error(f"Error connecting to AWS Bedrock: {str(e)}")
+        error_msg = f"Error connecting to AWS Bedrock: {str(e)}"
+        log_error(error_msg, e)
+        st.error(error_msg)
         return None
 
-def safe_bedrock_call(bedrock_client, prompt: str, max_retries: int = 3) -> Optional[str]:
+def safe_bedrock_call(bedrock_client, prompt: str, max_retries: int = 3, request_type: str = "general") -> Optional[str]:
     """Make a safe Bedrock API call with retries and error handling"""
+    
+    # Log the request
+    log_llm_request(prompt, request_type, MODEL_ID)
+    
+    start_time = time.time()
+    
     for attempt in range(max_retries):
         try:
             body = json.dumps({
@@ -78,14 +92,25 @@ def safe_bedrock_call(bedrock_client, prompt: str, max_retries: int = 3) -> Opti
             })
             
             response = bedrock_client.invoke_model(
-                modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+                modelId=MODEL_ID,
                 body=body
             )
             
             response_body = json.loads(response['body'].read())
-            return response_body['content'][0]['text']
+            response_text = response_body['content'][0]['text']
+            
+            # Log successful response
+            processing_time = time.time() - start_time
+            log_llm_response(response_text, request_type, MODEL_ID, processing_time, 
+                           {"attempt_number": attempt + 1, "max_retries": max_retries})
+            
+            return response_text
             
         except Exception as e:
+            # Log the error
+            log_llm_error(str(e), request_type, MODEL_ID, 
+                         {"max_retries": max_retries, "attempt": attempt + 1})
+            
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)  # Exponential backoff
                 continue
@@ -96,6 +121,7 @@ def expand_requirement_agent(basic_requirement: str, requirement_type: str, bedr
     """Expand a basic requirement into a detailed requirement using Claude"""
     
     agent_state.update_step("expanding", 10, "Starting requirement expansion...")
+    log_workflow_step("expand_requirement", "started", {"requirement_type": requirement_type})
     
     prompt = f"""Expand the following basic {requirement_type} requirement into a detailed requirement.
     Include specific details about:
@@ -112,23 +138,28 @@ def expand_requirement_agent(basic_requirement: str, requirement_type: str, bedr
     
     try:
         agent_state.add_message("Calling AWS Bedrock API...")
-        detailed_requirement = safe_bedrock_call(bedrock_client, prompt)
+        detailed_requirement = safe_bedrock_call(bedrock_client, prompt, request_type="requirement_expansion")
         
         if detailed_requirement:
             agent_state.update_step("expanded", 30, f"✅ Requirement expanded successfully! ({len(detailed_requirement)} characters)")
+            log_workflow_step("expand_requirement", "completed", 
+                            {"requirement_type": requirement_type, "output_length": len(detailed_requirement)})
             return detailed_requirement
         else:
             agent_state.set_error("Failed to expand requirement - empty response")
+            log_workflow_step("expand_requirement", "failed", {"error": "empty response"})
             return None
             
     except Exception as e:
         agent_state.set_error(f"Error expanding requirement: {str(e)}")
+        log_workflow_step("expand_requirement", "error", {"error": str(e)})
         return None
 
 def breakdown_requirement_agent(detailed_requirement: str, requirement_type: str, bedrock_client, agent_state: AgentState) -> Optional[List[str]]:
     """Break down a detailed requirement into individual task descriptions"""
     
     agent_state.update_step("breaking_down", 40, "Breaking down requirement into tasks...")
+    log_workflow_step("breakdown_requirement", "started", {"requirement_type": requirement_type})
     
     prompt = f"""Break down the following detailed {requirement_type} requirement into individual tasks.
     Each task should be specific, actionable, and independent.
@@ -141,10 +172,11 @@ def breakdown_requirement_agent(detailed_requirement: str, requirement_type: str
     
     try:
         agent_state.add_message("Analyzing requirement structure...")
-        content = safe_bedrock_call(bedrock_client, prompt)
+        content = safe_bedrock_call(bedrock_client, prompt, request_type="requirement_breakdown")
         
         if not content:
             agent_state.set_error("Failed to get breakdown response")
+            log_workflow_step("breakdown_requirement", "failed", {"error": "empty response"})
             return None
         
         agent_state.add_message("Parsing task breakdown...")
@@ -156,16 +188,21 @@ def breakdown_requirement_agent(detailed_requirement: str, requirement_type: str
             json_str = content[start_idx:end_idx]
             tasks = json.loads(json_str)
             agent_state.update_step("broken_down", 60, f"✅ Breakdown complete! Found {len(tasks)} tasks")
+            log_workflow_step("breakdown_requirement", "completed", 
+                            {"requirement_type": requirement_type, "task_count": len(tasks)})
             return tasks
         else:
             agent_state.set_error("Could not find valid task list in response")
+            log_workflow_step("breakdown_requirement", "failed", {"error": "invalid JSON format"})
             return None
             
     except json.JSONDecodeError as e:
         agent_state.set_error(f"Error parsing task JSON: {str(e)}")
+        log_workflow_step("breakdown_requirement", "error", {"error": f"JSON parsing: {str(e)}"})
         return None
     except Exception as e:
         agent_state.set_error(f"Error breaking down requirement: {str(e)}")
+        log_workflow_step("breakdown_requirement", "error", {"error": str(e)})
         return None
 
 def create_jira_story_agent(requirement: str, requirement_type: str, bedrock_client, task_num: int, total_tasks: int, agent_state: AgentState) -> Optional[Dict]:
@@ -173,6 +210,8 @@ def create_jira_story_agent(requirement: str, requirement_type: str, bedrock_cli
     
     progress = 60 + (task_num / total_tasks) * 30
     agent_state.update_step("creating_stories", int(progress), f"Creating JIRA story {task_num}/{total_tasks}...")
+    log_workflow_step("create_jira_story", "started", 
+                     {"task_num": task_num, "total_tasks": total_tasks, "requirement_type": requirement_type})
     
     prompt = f"""Convert the following {requirement_type} requirement into a JIRA story. 
     Include the following fields:
@@ -199,10 +238,12 @@ def create_jira_story_agent(requirement: str, requirement_type: str, bedrock_cli
     
     try:
         agent_state.add_message(f"Generating story {task_num}: {requirement[:50]}...")
-        content = safe_bedrock_call(bedrock_client, prompt)
+        content = safe_bedrock_call(bedrock_client, prompt, request_type="jira_story_creation")
         
         if not content:
             agent_state.add_message(f"⚠️ Failed to generate story {task_num}")
+            log_workflow_step("create_jira_story", "failed", 
+                            {"task_num": task_num, "error": "empty response"})
             return None
         
         # Extract JSON from response
@@ -212,16 +253,25 @@ def create_jira_story_agent(requirement: str, requirement_type: str, bedrock_cli
             json_str = content[start_idx:end_idx]
             story = json.loads(json_str)
             agent_state.add_message(f"✅ Story {task_num} created: {story.get('Summary', 'Unknown')}")
+            log_workflow_step("create_jira_story", "completed", 
+                            {"task_num": task_num, "story_summary": story.get('Summary', 'Unknown'),
+                             "story_points": story.get('StoryPoints', 0)})
             return story
         else:
             agent_state.add_message(f"⚠️ Could not parse story {task_num} - invalid JSON format")
+            log_workflow_step("create_jira_story", "failed", 
+                            {"task_num": task_num, "error": "invalid JSON format"})
             return None
             
     except json.JSONDecodeError as e:
         agent_state.add_message(f"⚠️ JSON parsing error for story {task_num}: {str(e)}")
+        log_workflow_step("create_jira_story", "error", 
+                        {"task_num": task_num, "error": f"JSON parsing: {str(e)}"})
         return None
     except Exception as e:
         agent_state.add_message(f"⚠️ Error creating story {task_num}: {str(e)}")
+        log_workflow_step("create_jira_story", "error", 
+                        {"task_num": task_num, "error": str(e)})
         return None
 
 def run_agent_workflow(basic_requirement: str, requirement_type: str, bedrock_client):
@@ -230,14 +280,19 @@ def run_agent_workflow(basic_requirement: str, requirement_type: str, bedrock_cl
     # Initialize agent state
     agent_state = AgentState()
     
+    log_workflow_step("agentic_workflow", "started", 
+                     {"requirement_type": requirement_type, "requirement_length": len(basic_requirement)})
+    
     # Step 1: Expand requirement
     detailed_requirement = expand_requirement_agent(basic_requirement, requirement_type, bedrock_client, agent_state)
     if not detailed_requirement:
+        log_workflow_step("agentic_workflow", "failed", {"failed_step": "requirement_expansion"})
         return agent_state, None, []
     
     # Step 2: Break down into tasks
     tasks = breakdown_requirement_agent(detailed_requirement, requirement_type, bedrock_client, agent_state)
     if not tasks:
+        log_workflow_step("agentic_workflow", "failed", {"failed_step": "requirement_breakdown"})
         return agent_state, detailed_requirement, []
     
     # Step 3: Create JIRA stories
@@ -251,6 +306,10 @@ def run_agent_workflow(basic_requirement: str, requirement_type: str, bedrock_cl
         time.sleep(0.5)
     
     agent_state.update_step("completed", 100, f"🎉 Workflow completed! Generated {len(stories)} stories from {len(tasks)} tasks")
+    
+    log_workflow_step("agentic_workflow", "completed", 
+                     {"requirement_type": requirement_type, "total_tasks": len(tasks), 
+                      "successful_stories": len(stories), "success_rate": len(stories)/len(tasks) if tasks else 0})
     
     return agent_state, detailed_requirement, stories
 
